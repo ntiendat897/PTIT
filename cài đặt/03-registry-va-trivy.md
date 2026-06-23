@@ -1,83 +1,57 @@
-# 03 — Harbor (registry) & Trivy trên một server
+# 03 — Harbor (registry nội bộ) + Trivy (Ubuntu 24.04)
 
-Mô hình: cài **toàn bộ Harbor + Trivy trên một server duy nhất** bằng bộ cài chính thức (Docker Compose), dùng PostgreSQL/Redis/lưu trữ **đi kèm trong gói** (không tách ra ngoài). Tuy gói gọn trên một máy, vẫn giữ chuẩn production: **HTTPS bằng chứng chỉ thật, đổi mật khẩu admin, robot account least-privilege, gating lỗ hổng, yêu cầu ảnh đã ký, và sao lưu**.
+Harbor chạy trên **một server riêng** (`registry.vnpt.vn`), **tích hợp Trivy** để tự động quét lỗ hổng khi push image. TLS bằng **chứng chỉ CA nội bộ VNPT** (không dùng HTTP). Dữ liệu lưu ngay trên server (PostgreSQL/Redis/registry đi kèm), có sao lưu.
+
+> Server đã làm cứng theo file 01. Mở cổng 443 giới hạn theo subnet nội bộ.
 
 ```bash
-export HARBOR_HOST="harbor.example.com"   # tên miền trỏ về server này
-export HARBOR_PROJECT="myapp"
+export HARBOR_HOST="registry.vnpt.vn"
+export HARBOR_PROJECT="myvnpt"
 ```
-
-> Yêu cầu server: 4 vCPU, 8 GB RAM, ổ đĩa rộng cho image (vd 100 GB+), Ubuntu 22.04, đã cài Docker + Docker Compose (file 01). Mở cổng 80/443.
 
 ---
 
-## 1. Chuẩn bị chứng chỉ TLS (bắt buộc — không dùng HTTP)
+## 1. Chuẩn bị Docker + chứng chỉ TLS
 
-Chọn một trong hai cách.
-
-### Cách A — Let's Encrypt (server có tên miền ra Internet)
 ```bash
-sudo apt-get install -y certbot
-# Lấy chứng chỉ (dừng dịch vụ đang chiếm cổng 80 nếu có)
-sudo certbot certonly --standalone -d $HARBOR_HOST
-# Chứng chỉ nằm tại:
-#   /etc/letsencrypt/live/$HARBOR_HOST/fullchain.pem
-#   /etc/letsencrypt/live/$HARBOR_HOST/privkey.pem
-```
-
-### Cách B — CA nội bộ công ty / self-signed (mạng nội bộ)
-```bash
+# Docker Engine (noble) — như file 02 mục 2
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+# Chứng chỉ CA nội bộ cấp cho registry.vnpt.vn
 sudo mkdir -p /data/cert
-# Nếu công ty đã có CA: xin cấp cert cho $HARBOR_HOST rồi đặt vào /data/cert/
-# Hoặc tự tạo (nội bộ):
-openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
-  -keyout /data/cert/harbor.key -out /data/cert/harbor.crt \
-  -subj "/CN=$HARBOR_HOST" -addext "subjectAltName=DNS:$HARBOR_HOST"
+sudo cp registry.vnpt.vn.crt /data/cert/harbor.crt
+sudo cp registry.vnpt.vn.key /data/cert/harbor.key
 ```
-> Dùng CA nội bộ thì phải phân phối **CA gốc** tới mọi máy pull/push (xem Mục 6).
+> Dùng chứng chỉ do **CA nội bộ VNPT** cấp cho `registry.vnpt.vn`. Mọi máy pull/push phải tin CA này (mục 6).
 
 ---
 
-## 2. Tải bộ cài Harbor (bản mới nhất)
+## 2. Tải Harbor (bản mới nhất)
 
 ```bash
 cd ~
 HARBOR_VER=$(curl -s https://api.github.com/repos/goharbor/harbor/releases/latest | grep -oP '"tag_name": "\K[^"]+')
-echo "Harbor moi nhat: $HARBOR_VER"     # tại thời điểm viết là v2.14.4
+echo "Harbor: $HARBOR_VER"
 wget https://github.com/goharbor/harbor/releases/download/${HARBOR_VER}/harbor-online-installer-${HARBOR_VER}.tgz
-tar xzvf harbor-online-installer-${HARBOR_VER}.tgz
-cd harbor
+tar xzf harbor-online-installer-${HARBOR_VER}.tgz && cd harbor
 cp harbor.yml.tmpl harbor.yml
 ```
 
 ---
 
-## 3. Cấu hình `harbor.yml` (HTTPS, một server)
-
-Sửa các mục sau trong `harbor.yml`:
+## 3. Cấu hình `harbor.yml`
 
 ```yaml
-hostname: harbor.example.com           # = $HARBOR_HOST
-
+hostname: registry.vnpt.vn
 http:
-  port: 80                             # chỉ để redirect sang https
-
+  port: 80                      # chỉ redirect sang https
 https:
   port: 443
-  # Cách A (Let's Encrypt):
-  certificate: /etc/letsencrypt/live/harbor.example.com/fullchain.pem
-  private_key: /etc/letsencrypt/live/harbor.example.com/privkey.pem
-  # Cách B (CA nội bộ): trỏ tới /data/cert/harbor.crt và /data/cert/harbor.key
-
-harbor_admin_password: "DAT_MAT_KHAU_MANH_O_DAY"   # đổi ngay, không để mặc định
-
-# Lưu trữ ngay trên server này (không tách S3)
-data_volume: /data
-
-# (mặc định) PostgreSQL & Redis chạy kèm trong gói — giữ nguyên, không cấu hình external
+  certificate: /data/cert/harbor.crt
+  private_key: /data/cert/harbor.key
+harbor_admin_password: "ĐẶT_MẬT_KHẨU_MẠNH"
+data_volume: /data             # nên là ổ đĩa riêng, mount noatime
+# (mặc định) PostgreSQL/Redis/registry chạy kèm — giữ nguyên cho mô hình 1 server
 ```
-
-> Lưu ý: để mặc định nghĩa là Harbor tự chạy database + redis + registry trong các container trên chính server này — đúng yêu cầu "không tách đi đâu".
 
 ---
 
@@ -85,131 +59,68 @@ data_volume: /data
 
 ```bash
 sudo ./install.sh --with-trivy
+sudo docker compose ps          # các container Up/healthy
+curl -kI https://registry.vnpt.vn
 ```
-Cờ `--with-trivy` bật scanner Trivy ngay trong Harbor (quét ảnh khi push). Khi xong sẽ hiện "✔ ----Harbor has been installed and started successfully----".
+Mở `https://registry.vnpt.vn`, đăng nhập `admin`.
 
-**Kiểm tra:**
-```bash
-sudo docker compose ps               # tất cả container Up/healthy (core, db, redis, registry, trivy-adapter, portal…)
-curl -I https://$HARBOR_HOST         # trả về HTTP 200/302 qua HTTPS
-```
-Mở `https://$HARBOR_HOST`, đăng nhập `admin` / mật khẩu vừa đặt.
-
-> Quản lý vòng đời (trong thư mục `~/harbor`):
-> ```bash
-> sudo docker compose down            # dừng
-> sudo docker compose up -d           # chạy lại
-> sudo ./prepare && sudo docker compose up -d   # sau khi sửa harbor.yml hoặc gia hạn cert
-> ```
+> Quản lý vòng đời (trong `~/harbor`): `sudo docker compose down|up -d`; sau khi sửa `harbor.yml`: `sudo ./prepare && sudo docker compose up -d`.
 
 ---
 
-## 5. Cấu hình bảo mật trong Harbor
+## 5. Cấu hình bảo mật & quét tự động
 
-1. (Khuyến nghị) **Administration → Configuration → Authentication**: chuyển **OIDC/LDAP** trỏ tới hệ thống tài khoản công ty; tắt tự đăng ký.
-2. **Projects → New Project** tên `myapp` (Private). Vào **Configuration** của project:
+1. **Administration → Authentication**: chuyển **LDAP/OIDC** trỏ tới hệ thống tài khoản VNPT; tắt tự đăng ký.
+2. **Projects → New Project** `myvnpt` (Private). Vào **Configuration**:
    - Bật **"Automatically scan images on push"** (Trivy tự quét).
-   - Bật **"Prevent vulnerable images from running"**, ngưỡng `High` → chặn pull ảnh vượt ngưỡng.
-   - Bật **Cosign** trong Content Trust để yêu cầu ảnh đã ký.
-3. Đặt **quota** dung lượng và **tag retention/immutability** để giữ lịch sử, chống ghi đè tag.
+   - Bật **"Prevent vulnerable images from running"**, ngưỡng `High`.
+   - Đặt **quota** dung lượng; bật **tag retention/immutability**.
+3. **Vulnerability → Update** CSDL Trivy định kỳ (hoặc bật tự cập nhật).
 
 ---
 
-## 6. Cho Docker host & k3s tin tưởng Harbor
+## 6. Robot account cho CI & tin tưởng CA
 
-### Nếu dùng Let's Encrypt (chứng chỉ công khai, đã tin sẵn)
-Không cần thêm gì — Docker và k3s tin chứng chỉ ngay.
+**Project `myvnpt` → Robot Accounts → New**: chỉ `push`+`pull` trên project. Lưu token vào credential `jenkins.devops` (file 02).
 
-### Nếu dùng CA nội bộ / self-signed
-Phân phối CA tới mọi máy pull/push (không dùng `insecure-registries`):
-
+Cho Docker (server Jenkins/agent) và k8s tin CA nội bộ (TLS thật, **không** dùng insecure):
 ```bash
-# Trên máy chạy Docker (vd server build/Jenkins)
-sudo mkdir -p /etc/docker/certs.d/$HARBOR_HOST
-sudo cp ca.crt /etc/docker/certs.d/$HARBOR_HOST/ca.crt
+# Trên server build
+sudo mkdir -p /etc/docker/certs.d/registry.vnpt.vn
+sudo cp vnpt-ca.crt /etc/docker/certs.d/registry.vnpt.vn/ca.crt
 sudo systemctl restart docker
-
-# Trên node k3s: thêm CA vào registries.yaml (dùng TLS, KHÔNG insecure)
-sudo tee /etc/rancher/k3s/registries.yaml > /dev/null <<EOF
-configs:
-  "$HARBOR_HOST":
-    tls:
-      ca_file: /etc/ssl/harbor-ca.crt
+# Trên node K8s (containerd): khai báo CA cho registry
+sudo tee /etc/containerd/certs.d/registry.vnpt.vn/hosts.toml >/dev/null <<EOF
+server = "https://registry.vnpt.vn"
+[host."https://registry.vnpt.vn"]
+  ca = "/etc/ssl/vnpt-ca.crt"
 EOF
-sudo cp ca.crt /etc/ssl/harbor-ca.crt
-sudo systemctl restart k3s
+sudo cp vnpt-ca.crt /etc/ssl/vnpt-ca.crt && sudo systemctl restart containerd
 ```
 
-Đăng nhập và đẩy thử:
+Đẩy thử:
 ```bash
-docker login $HARBOR_HOST -u admin
-docker pull alpine:latest
-docker tag alpine:latest $HARBOR_HOST/$HARBOR_PROJECT/myapp:test
-docker push $HARBOR_HOST/$HARBOR_PROJECT/myapp:test
+docker login registry.vnpt.vn -u admin
+docker pull alpine:latest && docker tag alpine:latest registry.vnpt.vn/myvnpt/test:1 && docker push registry.vnpt.vn/myvnpt/test:1
 ```
-Vào project `myapp` → **Repositories**, thấy `myapp` cùng kết quả quét CVE.
 
 ---
 
-## 7. Robot account cho CI (least privilege)
+## 7. Sao lưu Harbor (DR)
 
-Không dùng admin cho pipeline:
-- **Project `myapp` → Robot Accounts → New Robot Account**, chỉ cấp `push` + `pull` trên project này.
-- Lưu token an toàn; trong Jenkins tạo credential từ token này (không dùng tài khoản admin).
-
----
-
-## 8. Trivy CLI (cổng chặn trong pipeline)
-
-Harbor tự quét sau khi push; trong pipeline nên quét **trước khi push** để chặn sớm. Cài Trivy CLI trên server build (hoặc dùng container `aquasec/trivy`):
-
+Dữ liệu nằm trong `/data` (DB + layer image). Sao lưu định kỳ:
 ```bash
-sudo apt-get install -y wget gnupg
-wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | \
-  sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg
-echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | \
-  sudo tee /etc/apt/sources.list.d/trivy.list
-sudo apt-get update && sudo apt-get install -y trivy
-trivy --version
-```
-
-Dùng làm cổng chặn:
-```bash
-trivy image --severity HIGH,CRITICAL --exit-code 0 $HARBOR_HOST/$HARBOR_PROJECT/myapp:$TAG   # báo cáo
-trivy image --severity CRITICAL --exit-code 1 $HARBOR_HOST/$HARBOR_PROJECT/myapp:$TAG          # FAIL build nếu có CRITICAL
-```
-
-| Lớp quét | Khi nào | Vai trò |
-|---|---|---|
-| Trivy CLI (pipeline) | Trước khi push | Chặn sớm, không cho ảnh lỗi lên registry |
-| Trivy trong Harbor | Sau khi push + định kỳ | Lưu lịch sử CVE, chặn pull theo chính sách |
-
----
-
-## 9. Sao lưu Harbor (trên cùng server + bản offsite)
-
-Vì mọi dữ liệu nằm trên một server, backup càng quan trọng. Dữ liệu cần sao lưu nằm trong `data_volume` (`/data`): database (metadata) và layer image.
-
-```bash
-# Dừng để snapshot nhất quán (hoặc dùng cơ chế dump DB của Harbor)
 cd ~/harbor && sudo docker compose down
 sudo tar czf /backup/harbor-$(date +%F).tgz /data ~/harbor/harbor.yml
 sudo docker compose up -d
-# Sao thêm một bản ra máy/ổ khác (offsite) để phòng hỏng server
-rsync -a /backup/ user@backup-host:/harbor-backups/
+# Đồng bộ ra máy/ổ backup nội bộ
+rsync -a /backup/ backup-host:/harbor-backups/
 ```
-Đặt lịch (cron) chạy hằng đêm và **kiểm thử khôi phục định kỳ**. Nếu dùng Let's Encrypt, đặt cron `certbot renew` + `./prepare && docker compose up -d` để gia hạn cert.
+Đặt cron hằng đêm và **kiểm thử khôi phục** định kỳ. Gia hạn chứng chỉ trước khi hết hạn.
 
----
-
-## Liên hệ với file 05
-
-- Tên image: `harbor.example.com/myapp/<app>`.
-- Pull secret cho cụm: tạo `regcred` từ robot account; Deployment/Helm tham chiếu `imagePullSecrets`.
-- Credential Jenkins: dùng token robot account (ID `harbor`), không dùng admin.
+**Kiểm tra:** push image → Harbor tự quét Trivy và hiển thị CVE; image vượt ngưỡng High bị chặn pull.
 
 ---
 
 ## Tổng kết file 03
-
-Harbor + Trivy chạy gọn trên một server với HTTPS thật, gating CVE, yêu cầu ảnh đã ký, robot account và backup. Sang `04-kafka-elk-cluster.md`.
+Harbor chạy nội bộ với TLS CA nội bộ, Trivy tự quét, robot account, chính sách chặn lỗ hổng và backup. Sang `04-kafka-elk-cluster.md`.

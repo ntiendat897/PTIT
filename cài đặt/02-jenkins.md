@@ -1,177 +1,121 @@
-# 02 — Jenkins CI (production)
+# 02 — Jenkins CI trên server riêng (Ubuntu 24.04)
 
-Jenkins chỉ đảm nhiệm **CI**: build image **rootless**, test, quét bảo mật, **ký image**, push lên Harbor, rồi cập nhật image tag vào repo manifests. Việc triển khai lên cụm do **Argo CD** lo (xem file 05). Jenkins **không** có quyền `kubectl apply` lên production.
+Jenkins chạy trên **một server riêng** (`jenkins.vnpt.vn`) cùng **agent build**, đăng nhập quản trị qua **LDAP**. Pipeline build ứng dụng Java bằng **Maven** (chạy trong container), phân tích SonarQube, đóng gói và đẩy image lên Harbor, cập nhật Helm Chart ở kho `devsecops`, và thông báo Telegram.
 
-Khác biệt so với bản lab:
-- Không mount `docker.sock`, không `chmod 666` — build bằng **Kaniko** (rootless, trong pod).
-- Jenkins chạy **trên K8s** qua Helm, dùng **agent động** (mỗi build một pod, tự hủy).
-- Truy cập qua **HTTPS/Ingress**; bí mật lấy từ **Vault** qua External Secrets.
+> Server này đã được làm cứng theo file 01. Mở thêm cổng web Jenkins giới hạn theo subnet nội bộ.
 
 ---
 
-## 1. Cài Jenkins trên K8s qua Helm
-
-`jenkins-values.yaml`:
-```yaml
-controller:
-  image:
-    tag: "lts-jdk21"
-  replicaCount: 1
-  resources:
-    requests: { cpu: "1", memory: 2Gi }
-    limits:   { cpu: "2", memory: 4Gi }
-  ingress:
-    enabled: true
-    ingressClassName: nginx
-    hostName: jenkins.example.com
-    annotations:
-      cert-manager.io/cluster-issuer: letsencrypt-prod
-    tls:
-      - secretName: jenkins-tls
-        hosts: [ jenkins.example.com ]
-  installPlugins:
-    - kubernetes:latest
-    - workflow-aggregator:latest
-    - git:latest
-    - configuration-as-code:latest
-    - prometheus:latest          # xuất metrics cho Prometheus
-  JCasC:
-    defaultConfig: true
-  additionalExistingSecrets: []
-persistence:
-  enabled: true
-  storageClass: "<ten-sc>"
-  size: 20Gi
-serviceAccount:
-  create: true
-agent:
-  enabled: true                  # bật agent động trên K8s
-  podName: jenkins-agent
-  resources:
-    requests: { cpu: "500m", memory: 1Gi }
-    limits:   { cpu: "2", memory: 4Gi }
-rbac:
-  create: true
-```
+## 1. Cài Java và Jenkins (LTS)
 
 ```bash
-helm install jenkins jenkins/jenkins -n jenkins -f jenkins-values.yaml
+# Java 21 (Temurin) — cho Jenkins
+sudo mkdir -p /etc/apt/keyrings
+wget -qO- https://packages.adoptium.net/artifactory/api/gpg/key/public | sudo gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg
+echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb noble main" | sudo tee /etc/apt/sources.list.d/adoptium.list
+# Kho Jenkins LTS
+curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key | sudo tee /usr/share/keyrings/jenkins-keyring.asc >/dev/null
+echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/" | sudo tee /etc/apt/sources.list.d/jenkins.list >/dev/null
+sudo apt update && sudo apt install -y temurin-21-jdk jenkins
+sudo systemctl enable --now jenkins
 ```
 
-**Kiểm tra:**
+**Mật khẩu admin ban đầu:**
 ```bash
-kubectl -n jenkins get pods,ingress
-# Mật khẩu admin ban đầu:
-kubectl -n jenkins exec svc/jenkins -c jenkins -- \
-  cat /run/secrets/additional/chart-admin-password 2>/dev/null || \
-kubectl -n jenkins get secret jenkins -o go-template='{{.data.jenkins-admin-password | base64decode}}'
-```
-Truy cập `https://jenkins.example.com` (chứng chỉ do cert-manager cấp).
-
-> Khuyến nghị production: thay đăng nhập admin nội bộ bằng **OIDC/LDAP** (qua plugin `oic-auth`/`ldap`), cấu hình bằng **JCasC** để toàn bộ Jenkins là code.
-
----
-
-## 2. Bí mật từ Vault (không để phẳng)
-
-Tạo `ExternalSecret` kéo thông tin từ Vault thành Secret K8s mà pipeline dùng:
-
-`jenkins-externalsecrets.yaml`:
-```yaml
-apiVersion: external-secrets.io/v1beta1
-kind: ExternalSecret
-metadata: { name: ci-credentials, namespace: jenkins }
-spec:
-  refreshInterval: 1h
-  secretStoreRef: { name: vault-backend, kind: ClusterSecretStore }
-  target: { name: ci-credentials }
-  data:
-    - secretKey: harbor-robot-user
-      remoteRef: { key: ci/harbor, property: username }
-    - secretKey: harbor-robot-pass
-      remoteRef: { key: ci/harbor, property: password }
-    - secretKey: cosign-key
-      remoteRef: { key: ci/cosign, property: key }
-    - secretKey: cosign-password
-      remoteRef: { key: ci/cosign, property: password }
-    - secretKey: git-token
-      remoteRef: { key: ci/git, property: token }
-```
-```bash
-kubectl apply -f jenkins-externalsecrets.yaml
-kubectl -n jenkins get secret ci-credentials
+sudo cat /var/lib/jenkins/secrets/initialAdminPassword
 ```
 
 ---
 
-## 3. Build image rootless bằng Kaniko (pod agent)
+## 2. Công cụ build trên server/agent
 
-Định nghĩa pod agent có 3 container: `kaniko` (build+push), `trivy` (scan), `cosign` (ký). Đưa vào pipeline ở file 05; phần khai báo pod template (Jenkins Kubernetes plugin):
+Pipeline build Maven **chạy trong container Docker** (`docker run maven...`), nên server agent cần Docker; ngoài ra cần Docker để build và push image lên Harbor.
 
-```groovy
-// Khai báo trong Jenkinsfile (xem file 05) — agent pod nhiều container
-podTemplate(yaml: '''
-  apiVersion: v1
-  kind: Pod
-  spec:
-    securityContext:
-      runAsNonRoot: true
-      runAsUser: 1000
-    containers:
-      - name: kaniko
-        image: gcr.io/kaniko-project/executor:latest
-        command: ["sleep"]
-        args: ["infinity"]
-        volumeMounts:
-          - name: harbor-auth
-            mountPath: /kaniko/.docker
-      - name: trivy
-        image: aquasec/trivy:latest
-        command: ["sleep"]
-        args: ["infinity"]
-      - name: cosign
-        image: gcr.io/projectsigstore/cosign:latest
-        command: ["sleep"]
-        args: ["infinity"]
-    volumes:
-      - name: harbor-auth
-        secret:
-          secretName: ci-credentials
-          items:
-            - key: harbor-dockerconfig
-              path: config.json
-''') { /* các stage build/scan/sign/push ở file 05 */ }
+```bash
+# Docker Engine (Ubuntu 24.04 - noble)
+sudo install -m0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable" | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
+sudo apt update && sudo apt install -y docker-ce docker-ce-cli containerd.io
+# Cho user jenkins dùng Docker (cân nhắc bảo mật: chỉ trên server build nội bộ)
+sudo usermod -aG docker jenkins && sudo systemctl restart jenkins
 ```
-
-Vì sao Kaniko: build image trong userspace, **không cần Docker daemon, không cần quyền root, không mount socket** — loại bỏ lỗ hổng lớn nhất của bản lab.
+> Lưu ý bảo mật: quyền Docker tương đương root. Server build phải được cô lập, chỉ JUMP truy cập, và chỉ chạy pipeline tin cậy. (Phương án rootless/Kaniko là hướng nâng cao.)
 
 ---
 
-## 4. Ký image với Cosign (supply-chain security)
+## 3. HTTPS cho Jenkins (reverse proxy Nginx + TLS nội bộ)
 
-Trong pipeline, sau khi push image, ký bằng khóa Cosign lấy từ Vault:
+Không expose Jenkins HTTP. Đặt sau Nginx với chứng chỉ CA nội bộ.
 ```bash
-export COSIGN_PASSWORD="$cosign_password"
-cosign sign --key env://COSIGN_KEY $HARBOR/$PROJECT/myapp@$DIGEST
+sudo apt install -y nginx
+# Đặt chứng chỉ CA nội bộ: /etc/ssl/vnpt/jenkins.crt và jenkins.key
+sudo tee /etc/nginx/sites-available/jenkins >/dev/null <<'EOF'
+server {
+  listen 443 ssl;
+  server_name jenkins.vnpt.vn;
+  ssl_certificate     /etc/ssl/vnpt/jenkins.crt;
+  ssl_certificate_key /etc/ssl/vnpt/jenkins.key;
+  location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+  }
+}
+EOF
+sudo ln -s /etc/nginx/sites-available/jenkins /etc/nginx/sites-enabled/ && sudo nginx -t && sudo systemctl reload nginx
+# Tường lửa: chỉ cho subnet nội bộ truy cập 443
+sudo ufw allow from 10.0.0.0/24 to any port 443 proto tcp
 ```
-Cụm sẽ chỉ chạy image có chữ ký hợp lệ nhờ chính sách **Kyverno** (file 05). Khuyến nghị thêm: sinh **SBOM** (`trivy image --format cyclonedx`) và đính kèm (`cosign attach sbom`).
+Trong Jenkins, đặt Jenkins URL = `https://jenkins.vnpt.vn/`.
 
 ---
 
-## 5. Webhook & phân quyền
+## 4. Đăng nhập LDAP & phân quyền
 
-- Webhook GitHub/GitLab trỏ tới `https://jenkins.example.com/github-webhook/` (HTTPS).
-- Jenkins dùng **robot account** của Harbor (least privilege, chỉ push project tương ứng) — tạo ở file 03; không dùng admin.
-- Job định nghĩa bằng **Pipeline from SCM** (Jenkinsfile trong repo), không cấu hình tay.
+1. **Manage Jenkins → Plugins**: cài `LDAP`, `Matrix Authorization Strategy`, `Git`, `Pipeline`, `Docker Pipeline`, `SonarQube Scanner`, `Config File Provider`.
+2. **Security → Security Realm = LDAP**: trỏ tới máy chủ LDAP nội bộ (server, root DN, user search base).
+3. **Authorization = Matrix/Project-based**: cấp quyền theo nhóm LDAP (admin, dev, viewer). Bỏ "anyone can do anything".
 
-**Kiểm tra:**
-```bash
-# Build thử: pod agent xuất hiện rồi tự hủy
-kubectl -n jenkins get pods -w
-```
+---
+
+## 5. Agent build (nút agent01)
+
+Tạo agent để tách tải build khỏi controller (đúng mô hình `label 'agent01'` trong pipeline).
+- **Manage Jenkins → Nodes → New Node**: tên `agent01`, Launch method = **SSH** (Jenkins kết nối tới server agent qua SSH bằng credential khóa).
+- Trên server agent: cài Java 21 + Docker (như mục 1–2), tạo thư mục `/opt/jenkins/workspace` (khớp `devopsFolder` trong pipeline), quyền cho user agent.
+
+---
+
+## 6. Credentials (không để bí mật phẳng)
+
+**Manage Jenkins → Credentials → System → Global**, thêm:
+
+| Kind | ID | Dùng cho |
+|---|---|---|
+| Username/Password (hoặc token) | `jenkins.devops` | clone GitLab + push Harbor + push kho devsecops |
+| Secret text | `telegram-token` | token bot Telegram |
+| Secret text | `sonar-token` | xác thực SonarQube |
+
+> Token Harbor nên là **robot account** (quyền push/pull đúng project), không dùng admin. Tham chiếu các ID này trong Jenkinsfile (file 05).
+
+---
+
+## 7. Tích hợp SonarQube
+
+**Manage Jenkins → System → SonarQube servers**: thêm server `GDS Sonarqube` (URL nội bộ + `sonar-token`). **Global Tool Configuration**: khai báo `SonarScanner` và JDK (`jdk17`) như pipeline yêu cầu.
+
+---
+
+## 8. Webhook từ GitLab (kích hoạt khi đánh tag)
+
+Trong job pipeline, bật **Build Triggers → GitLab webhook**; sinh **secret token**. Trên GitLab khai báo webhook trỏ tới Jenkins, chọn **Tag push events** + dán secret token (chi tiết ở file 05 và đúng tài liệu CI/CD).
+
+**Kiểm tra:** đăng nhập LDAP được; agent `agent01` online; build thử một job → pod/agent chạy `docker run maven` thành công.
 
 ---
 
 ## Tổng kết file 02
-
-Jenkins chạy trên K8s, HTTPS, agent động, build **rootless Kaniko**, ký **Cosign**, bí mật từ **Vault**, chỉ làm CI và đẩy thay đổi vào Git. Sang `03-registry-va-trivy.md`.
+Jenkins chạy trên server riêng sau HTTPS, đăng nhập LDAP, có agent build Docker/Maven, credentials an toàn, tích hợp SonarQube và webhook GitLab. Sang `03-registry-va-trivy.md`.

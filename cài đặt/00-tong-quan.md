@@ -1,78 +1,63 @@
-# 00 — Tổng quan triển khai (chuẩn production)
+# 00 — Tổng quan triển khai (chuẩn production, Ubuntu 24.04)
 
-Bộ tài liệu này hướng dẫn triển khai **chuẩn production** cho đề tài *"Tự động hóa triển khai phần mềm kết hợp giám sát log tập trung"*, dùng làm cơ sở viết báo cáo thực tập tốt nghiệp (thạc sĩ).
+Bộ tài liệu hướng dẫn cài đặt **hoàn chỉnh** nền tảng CI/CD nội bộ theo đúng hệ thống thực tế, chạy trên **Ubuntu 24.04 LTS**, tối ưu và siết bảo mật theo chuẩn production.
 
-> Đây là môi trường **production thật**, không phải lab. Mọi thành phần đều bật bảo mật (TLS, xác thực, phân quyền), có tính sẵn sàng cao (HA), sao lưu/khôi phục (DR) và giám sát đầy đủ. Các "lối tắt lab" (HTTP, tắt security, single-node, mount docker.sock…) đều bị loại bỏ.
+> Mọi thành phần triển khai và sử dụng **nội bộ (on-premise)**, truy cập qua tên miền nội bộ. Không mở dịch vụ ra Internet. Mọi truy cập quản trị bắt buộc qua **JUMP server**.
 
-## Kiến trúc tổng thể
+## Kiến trúc và phân bổ máy chủ
 
-```
-Dev → Git (app repo) → Jenkins CI:
-        build rootless (Kaniko) → test → quét bảo mật (Trivy) → ký image (Cosign)
-        → push Harbor → cập nhật image tag ở Git (manifests repo)
+| Máy chủ / cụm | Vai trò | Ghi chú |
+|---|---|---|
+| JUMP server | Bastion — cổng quản trị duy nhất | MFA, ghi log phiên |
+| Rancher | Quản lý cụm Kubernetes | |
+| GitLab (`gitlab.myvnpt.com.vn`) | Kho mã nguồn + kho `devsecops` (Helm Chart) | thường đã có sẵn |
+| Jenkins + agent (`jenkins.vnpt.vn`) | CI: build Maven, đăng nhập **LDAP** | server riêng |
+| SonarQube (+ PostgreSQL) | Cổng chất lượng mã nguồn | thường đã có sẵn |
+| Harbor (`registry.vnpt.vn`) | Registry nội bộ + **Trivy** quét lỗ hổng | server riêng |
+| Cụm Kubernetes + Argo CD (`cd.vnpt.vn`) | Vận hành + phân phối liên tục (GitOps) | |
+| Cụm Kafka 3 node (KRaft) | Hàng đợi đệm log | file `04b` |
+| Cụm Elasticsearch + Kibana | Lưu trữ & trực quan hóa log | |
+| Prometheus + Grafana | Giám sát metrics, cảnh báo | |
 
-Argo CD (GitOps) theo dõi manifests repo → đồng bộ vào K8s → Argo Rollouts (canary/blue-green)
-        → Kyverno chỉ cho chạy image đã ký & đã quét
-
-Quan sát:  Pod → Filebeat → Kafka (Strimzi, TLS/SASL) → Logstash → Elasticsearch (ECK) → Kibana
-           Pod/cluster → Prometheus → Grafana + Alertmanager
-```
-
-Hai nguyên tắc cốt lõi:
-1. **GitOps**: Git là nguồn sự thật duy nhất; mọi thay đổi trạng thái cụm đều qua commit, Argo CD đồng bộ. Jenkins **không** `kubectl apply`/`helm upgrade` trực tiếp lên production.
-2. **Supply-chain security**: image được quét + ký; cụm chỉ chạy image đã ký qua chính sách Kyverno.
+Luồng CI/CD: **đánh tag trên GitLab → webhook → Jenkins** (clone → build Maven → SonarQube → build & push image lên Harbor → cập nhật `appVersion` trong Helm Chart ở kho `devsecops`) **→ Argo CD đồng bộ lên Kubernetes**. Thông báo qua **Telegram**.
 
 ## Nguyên tắc production áp dụng xuyên suốt
 
-- **TLS ở mọi nơi**: Harbor, Jenkins, Kibana, Grafana qua Ingress + cert-manager; Kafka/Elasticsearch mã hóa nội bộ.
-- **Bí mật tập trung**: dùng External Secrets Operator + Vault (hoặc Sealed Secrets), tuyệt đối không để mật khẩu phẳng trong Git/manifest.
-- **Least privilege**: RBAC chặt, ServiceAccount riêng từng workload, robot account cho CI.
-- **HA & dung lượng**: thành phần trạng thái (etcd, Harbor DB, Kafka, Elasticsearch) chạy nhiều bản sao, có StorageClass bền.
-- **Sao lưu & DR**: Velero cho cụm, etcd snapshot, snapshot Elasticsearch và Harbor ra object storage (S3).
-- **Quan sát đủ bộ ba**: metrics (Prometheus), logs (ELK), và sẵn sàng cho traces (OpenTelemetry).
-- **Resource governance**: requests/limits, HPA, PodDisruptionBudget, NetworkPolicy cho mọi workload.
+- **Bảo mật theo lớp**: mọi server làm cứng (hardening) như nhau (file 01); chỉ JUMP được SSH vào các server; tường lửa mặc định chặn; cập nhật bảo mật tự động.
+- **TLS nội bộ**: dùng CA nội bộ của VNPT (hoặc tự ký) cho Harbor, Jenkins, Kibana, Grafana, Argo CD, Kafka, Elasticsearch. Không dùng HTTP.
+- **Bí mật**: không để mật khẩu/token phẳng trong file cấu hình hay Git; dùng credential của Jenkins, biến môi trường có quyền hạn chế, hoặc Vault (nâng cao).
+- **Least privilege**: mỗi dịch vụ chạy bằng user riêng (non-root); phân quyền RBAC trên K8s; robot account trên Harbor; tài khoản LDAP cho Jenkins.
+- **Tối ưu tài nguyên**: tách ổ đĩa dữ liệu (SSD, `noatime`); chỉnh `sysctl`, `ulimit`; đặt heap JVM hợp lý (ES/Kafka/Jenkins/Sonar); để RAM còn lại cho page cache.
+- **Sao lưu & DR**: snapshot etcd, Elasticsearch, backup Harbor (DB + dữ liệu), backup cấu hình; kiểm thử khôi phục định kỳ.
+- **Quan sát đầy đủ**: log (Kafka–ELK) + metrics (Prometheus–Grafana) + thông báo (Telegram).
 
 ## Yêu cầu môi trường
 
-| Hạng mục | Yêu cầu production |
-|---|---|
-| Kubernetes | Cụm conformant, nhiều node (≥3 control-plane HA + worker), phiên bản ≥ 1.31 |
-| StorageClass | Hỗ trợ `ReadWriteOnce` bền (CSI), có snapshot |
-| Object storage | S3-compatible (cho backup ES/Harbor/Velero) |
-| DNS | Tên miền nội bộ/khả tín cho Harbor, Jenkins, Kibana, Grafana, ArgoCD |
-| CA/Chứng chỉ | Let's Encrypt hoặc CA nội bộ qua cert-manager |
-| Quản lý bí mật | Vault hoặc giải pháp tương đương |
+- **Hệ điều hành**: Ubuntu 24.04 LTS (64-bit) trên mọi server.
+- **Thời gian**: đồng bộ NTP (chrony) toàn hệ thống.
+- **DNS nội bộ**: phân giải các tên miền nội bộ (`*.vnpt.vn`, `gitlab.myvnpt.com.vn`).
+- **CA/Chứng chỉ**: CA nội bộ của VNPT cấp chứng chỉ cho từng dịch vụ.
+- **Tài nguyên tham khảo**: Jenkins 4 vCPU/8GB; Harbor 4 vCPU/8GB/100GB+; mỗi node Kafka 4 vCPU/16GB; mỗi node ES 8 vCPU/32GB; Kibana 2 vCPU/4GB; node K8s tùy tải.
 
 ## Thứ tự thực hiện
 
 | File | Nội dung |
 |---|---|
-| `01-ha-tang-nen.md` | Cụm K8s HA, platform services: ingress-nginx, cert-manager, External Secrets/Vault, StorageClass, Velero, namespaces & RBAC |
-| `02-jenkins.md` | Jenkins CI trên K8s (agent động, build rootless Kaniko, ký Cosign), HTTPS, secrets từ Vault |
-| `03-registry-va-trivy.md` | Harbor HA (Postgres/Redis/S3 ngoài, TLS, OIDC, robot account, gating, ký) + Trivy |
-| `04-kafka-elk-cluster.md` | Kafka qua Strimzi (TLS/SASL/ACL), ELK qua ECK (node roles, snapshot S3, ILM), Logstash, Filebeat |
-| `05-dong-goi-app-pipeline.md` | Dockerfile hardened, Helm chart production, Jenkinsfile CI, ArgoCD Application, Kyverno |
-| `06-rollout-observability-dr.md` | Argo Rollouts (canary), Prometheus/Grafana/Alertmanager, Velero DR, đo DORA |
-
-## Phiên bản — luôn dùng bản mới nhất
-
-Cài bằng lệnh tự lấy bản mới nhất khi có thể. Phiên bản tham chiếu tại thời điểm biên soạn (6/2026):
-
-| Thành phần | Bản (6/2026) | Nguồn |
-|---|---|---|
-| Harbor | v2.14.4 | tự dò GitHub API |
-| Elastic Stack (ECK quản lý) | 9.4.2 | manifest ECK |
-| ECK operator | 3.4.0 | Helm `elastic/eck-operator` |
-| Strimzi (Kafka operator) | mới nhất | Helm `strimzi/strimzi-kafka-operator` |
-| Argo CD / Argo Rollouts | mới nhất | manifest/Helm chính thức |
-| cert-manager, ingress-nginx, Kyverno, ESO, Velero, kube-prometheus-stack | mới nhất | Helm chính thức |
-| Jenkins | LTS mới nhất | Helm `jenkins/jenkins` |
+| `01-ha-tang-nen.md` | Làm cứng Ubuntu 24.04 cho mọi server; JUMP bastion; cụm Kubernetes; Rancher |
+| `02-jenkins.md` | Jenkins trên server riêng + agent (Maven, LDAP, Docker build), HTTPS |
+| `03-registry-va-trivy.md` | Harbor (registry.vnpt.vn) + Trivy, TLS nội bộ |
+| `04-kafka-elk-cluster.md` | Elasticsearch cluster + Kibana (giám sát log); Kafka xem `04b` |
+| `04b-kafka-cluster-3-server.md` | Cụm Kafka 3 server (KRaft, TLS/SASL/ACL) |
+| `05-dong-goi-app-pipeline.md` | Helm Chart trong kho devsecops; Argo CD; Jenkinsfile (Maven) + Telegram |
+| `06-observability-dr.md` | Prometheus + Grafana; sao lưu/DR; checklist nghiệm thu |
 
 ## Quy ước
 
 ```bash
-export BASE_DOMAIN="example.com"     # tên miền của bạn (harbor.example.com, jenkins.example.com…)
-export S3_ENDPOINT="https://s3.example.com"
+# Đặt sẵn (thay theo môi trường VNPT của bạn)
+export JUMP_IP="10.0.0.10"           # IP JUMP server
+export INTERNAL_DOMAIN="vnpt.vn"
+export ADMIN_USER="devops"           # user quản trị (non-root, sudo)
 ```
 
-Mỗi mục có phần **"Kiểm tra"** ở cuối — đạt rồi mới đi tiếp.
+Mỗi mục có phần **"Kiểm tra"** — đạt rồi mới đi tiếp.

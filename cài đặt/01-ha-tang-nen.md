@@ -1,189 +1,212 @@
-# 01 — Hạ tầng nền & platform services (production)
+# 01 — Làm cứng Ubuntu 24.04, JUMP server, Kubernetes & Rancher
 
-Giả định bạn đã có (hoặc tự dựng) một **cụm Kubernetes HA nhiều node**. File này tập trung vào: bảo đảm cụm đạt chuẩn HA, rồi cài các **platform service** bắt buộc cho production (ingress, TLS, secrets, storage, backup) trước khi triển khai ứng dụng.
-
----
-
-## 1. Cụm Kubernetes HA
-
-Yêu cầu tối thiểu cho production:
-
-- **≥ 3 control-plane** (etcd theo số lẻ để đạt quorum) + **≥ 2 worker**.
-- Phiên bản **≥ 1.31** (yêu cầu của ECK 3.4 và các operator mới).
-- Mỗi node tách vai trò; bật `kubelet` resource reserved; phân tách AZ/rack nếu có.
-
-### Nếu tự quản (kubeadm) — tóm tắt HA
-- Dựng control-plane đầu tiên với `--control-plane-endpoint` trỏ tới **load balancer** (HAProxy/keepalived) đứng trước API server.
-- `kubeadm join --control-plane` cho 2 control-plane còn lại → etcd 3 node.
-- Cài CNI (Calico/Cilium) hỗ trợ **NetworkPolicy** (bắt buộc cho production).
-
-### Nếu là k3s HA
-```bash
-# Server đầu tiên (embedded etcd)
-curl -sfL https://get.k3s.io | sh -s - server --cluster-init \
-  --tls-san <API_LB_DNS> --disable traefik --disable servicelb
-# Các server còn lại tham gia
-curl -sfL https://get.k3s.io | K3S_TOKEN=<token> sh -s - server \
-  --server https://<API_LB_DNS>:6443 --tls-san <API_LB_DNS> --disable traefik --disable servicelb
-```
-> Tắt `traefik`/`servicelb` mặc định để tự cài ingress-nginx + MetalLB/LoadBalancer chuẩn production.
-
-### etcd snapshot (DR)
-```bash
-# k3s: bật snapshot định kỳ ra S3
-curl -sfL https://get.k3s.io | sh -s - server \
-  --etcd-s3 --etcd-s3-endpoint $S3_ENDPOINT \
-  --etcd-s3-bucket k8s-etcd-backup \
-  --etcd-snapshot-schedule-cron "0 */6 * * *" --etcd-snapshot-retention 28
-# kubeadm: dùng etcdctl snapshot save theo CronJob, đẩy lên S3
-```
-
-**Kiểm tra:**
-```bash
-kubectl get nodes -o wide          # tất cả Ready, đúng số control-plane/worker
-kubectl version                    # server ≥ 1.31
-kubectl get --raw='/readyz?verbose'
-```
+File này gồm ba phần: (A) làm cứng (hardening) áp dụng cho **mọi server Ubuntu 24.04**; (B) thiết lập **JUMP server (bastion)**; (C) dựng **cụm Kubernetes** và **Rancher**.
 
 ---
 
-## 2. StorageClass bền + snapshot
+## A. Làm cứng cơ sở cho MỌI server (Ubuntu 24.04)
 
-Production cần CSI driver có hỗ trợ snapshot (ví dụ Ceph RBD, Longhorn, hoặc CSI của cloud).
+Thực hiện trên từng server ngay sau khi cài hệ điều hành.
 
+### A.1 Cập nhật và gói cơ bản
 ```bash
-kubectl get storageclass          # phải có 1 SC mặc định, RWO, allowVolumeExpansion=true
-kubectl get volumesnapshotclass   # phục vụ snapshot PVC
+sudo apt update && sudo apt -y full-upgrade
+sudo apt install -y vim curl wget git gnupg ca-certificates ufw fail2ban \
+  unattended-upgrades chrony auditd apparmor-utils
+sudo timedatectl set-timezone Asia/Ho_Chi_Minh
 ```
 
-Đặt SC mặc định nếu chưa có:
+### A.2 Người dùng quản trị & vô hiệu hóa root
 ```bash
-kubectl patch storageclass <ten-sc> \
-  -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+sudo adduser $ADMIN_USER
+sudo usermod -aG sudo $ADMIN_USER
+sudo mkdir -p /home/$ADMIN_USER/.ssh && sudo chmod 700 /home/$ADMIN_USER/.ssh
+# Dán public key của quản trị viên vào authorized_keys (chỉ đăng nhập bằng khóa)
+sudo vim /home/$ADMIN_USER/.ssh/authorized_keys
+sudo chmod 600 /home/$ADMIN_USER/.ssh/authorized_keys
+sudo chown -R $ADMIN_USER:$ADMIN_USER /home/$ADMIN_USER/.ssh
 ```
+
+### A.3 Làm cứng SSH
+Sửa `/etc/ssh/sshd_config` (hoặc tạo `/etc/ssh/sshd_config.d/99-hardening.conf`):
+```
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+KbdInteractiveAuthentication no
+X11Forwarding no
+MaxAuthTries 3
+AllowUsers devops
+ClientAliveInterval 300
+ClientAliveCountMax 2
+```
+```bash
+sudo systemctl restart ssh
+```
+
+### A.4 Tường lửa (UFW) — mặc định chặn
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+# Trên các server thường: CHỈ cho JUMP server SSH vào
+sudo ufw allow from $JUMP_IP to any port 22 proto tcp
+sudo ufw --force enable
+```
+> Trên JUMP server thì cho phép SSH từ dải mạng quản trị (xem phần B). Các cổng dịch vụ (Harbor 443, Kafka 9092/9093… ) sẽ mở giới hạn theo subnet ở từng file tương ứng.
+
+### A.5 fail2ban (chống dò mật khẩu)
+```bash
+sudo tee /etc/fail2ban/jail.local > /dev/null <<'EOF'
+[sshd]
+enabled = true
+bantime = 1h
+findtime = 10m
+maxretry = 5
+EOF
+sudo systemctl enable --now fail2ban
+```
+
+### A.6 Cập nhật bảo mật tự động
+```bash
+sudo dpkg-reconfigure -plow unattended-upgrades   # chọn Yes
+# hoặc bật thủ công:
+echo 'APT::Periodic::Unattended-Upgrade "1";' | sudo tee /etc/apt/apt.conf.d/20auto-upgrades
+```
+
+### A.7 Tối ưu kernel & giới hạn (sysctl/ulimit)
+```bash
+sudo tee /etc/sysctl.d/99-prod.conf > /dev/null <<'EOF'
+vm.swappiness = 1
+vm.max_map_count = 262144
+fs.file-max = 2097152
+net.core.somaxconn = 1024
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.rp_filter = 1
+EOF
+sudo sysctl --system
+sudo tee /etc/security/limits.d/99-prod.conf > /dev/null <<'EOF'
+* soft nofile 100000
+* hard nofile 100000
+EOF
+```
+
+### A.8 Đồng bộ thời gian
+```bash
+sudo systemctl enable --now chrony
+timedatectl   # "System clock synchronized: yes"
+```
+
+**Kiểm tra (mỗi server):** `ssh` chỉ vào được bằng khóa từ JUMP; `sudo ufw status` đúng quy tắc; `systemctl is-active fail2ban chrony` đều active.
 
 ---
 
-## 3. Helm và các kho chart
+## B. JUMP server (bastion)
 
+JUMP là **điểm vào quản trị duy nhất**: quản trị viên SSH vào JUMP rồi mới SSH tiếp tới các server.
+
+### B.1 Tường lửa JUMP
+```bash
+# Chỉ cho dải mạng quản trị (VD VPN/LAN quản trị) SSH vào JUMP
+sudo ufw allow from 10.0.0.0/24 to any port 22 proto tcp
+sudo ufw default deny incoming && sudo ufw --force enable
+```
+
+### B.2 MFA cho đăng nhập JUMP (Google Authenticator)
+```bash
+sudo apt install -y libpam-google-authenticator
+# Mỗi quản trị viên chạy 'google-authenticator' để tạo mã
+```
+Bật trong `/etc/pam.d/sshd`: thêm `auth required pam_google_authenticator.so`; trong sshd_config đặt `KbdInteractiveAuthentication yes` và `AuthenticationMethods publickey,keyboard-interactive`.
+
+### B.3 Ghi log phiên (audit)
+```bash
+sudo systemctl enable --now auditd
+# (Tùy chọn) cài 'tlog' hoặc ghi session để phục vụ kiểm toán quản trị
+```
+
+**Kiểm tra:** từ máy quản trị → SSH JUMP (yêu cầu khóa + mã MFA) → từ JUMP SSH được tới các server; các server từ chối SSH trực tiếp ngoài JUMP.
+
+---
+
+## C. Cụm Kubernetes (kubeadm, HA)
+
+Production nên dùng **≥ 3 control-plane + ≥ 2 worker**. Tóm tắt với kubeadm (containerd).
+
+### C.1 Chuẩn bị node K8s
+```bash
+sudo swapoff -a && sudo sed -i '/ swap / s/^/#/' /etc/fstab   # K8s yêu cầu tắt swap
+sudo modprobe overlay && sudo modprobe br_netfilter
+sudo tee /etc/modules-load.d/k8s.conf >/dev/null <<<'overlay
+br_netfilter'
+sudo tee /etc/sysctl.d/k8s.conf >/dev/null <<'EOF'
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+EOF
+sudo sysctl --system
+# containerd
+sudo apt install -y containerd
+sudo mkdir -p /etc/containerd && containerd config default | sudo tee /etc/containerd/config.toml >/dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sudo systemctl restart containerd
+```
+
+### C.2 Cài kubeadm/kubelet/kubectl
+```bash
+KVER=v1.31
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/$KVER/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes.gpg] https://pkgs.k8s.io/core:/stable:/$KVER/deb/ /" | sudo tee /etc/apt/sources.list.d/kubernetes.list
+sudo apt update && sudo apt install -y kubelet kubeadm kubectl && sudo apt-mark hold kubelet kubeadm kubectl
+```
+
+### C.3 Khởi tạo control-plane (HA qua load balancer)
+```bash
+sudo kubeadm init --control-plane-endpoint "<API_LB_DNS>:6443" \
+  --upload-certs --pod-network-cidr=10.244.0.0/16
+mkdir -p $HOME/.kube && sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config && sudo chown $(id -u):$(id -g) $HOME/.kube/config
+# CNI hỗ trợ NetworkPolicy (Calico)
+kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
+```
+Tham gia thêm control-plane (`kubeadm join ... --control-plane`) và worker (`kubeadm join ...`) theo lệnh kubeadm in ra.
+
+### C.4 etcd snapshot định kỳ (DR)
+```bash
+# CronJob đẩy snapshot etcd ra lưu trữ nội bộ/S3 (giữ ≥ 14 bản)
+sudo ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key snapshot save /backup/etcd-$(date +%F).db
+```
+
+**Kiểm tra:** `kubectl get nodes` Ready đủ số node; `kubectl get pods -A` (calico, coredns) Running.
+
+---
+
+## D. Rancher (quản lý cụm)
+
+Cài Rancher bằng Helm trên cụm (hoặc cụm quản lý riêng), TLS qua cert-manager + CA nội bộ.
 ```bash
 curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
-helm repo add jetstack https://charts.jetstack.io
-helm repo add external-secrets https://charts.external-secrets.io
-helm repo add hashicorp https://helm.releases.hashicorp.com
-helm repo add vmware-tanzu https://vmware-tanzu.github.io/helm-charts   # Velero
-helm repo add elastic https://helm.elastic.co
-helm repo add strimzi https://strimzi.io/charts/
-helm repo add kyverno https://kyverno.github.io/kyverno/
-helm repo add argo https://argoproj.github.io/argo-helm
-helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-helm repo update
+helm repo add jetstack https://charts.jetstack.io && helm repo add rancher https://releases.rancher.com/server-charts/stable && helm repo update
+helm install cert-manager jetstack/cert-manager -n cert-manager --create-namespace --set crds.enabled=true
+helm install rancher rancher/rancher -n cattle-system --create-namespace \
+  --set hostname=rancher.$INTERNAL_DOMAIN --set bootstrapPassword=<đặt-mạnh> \
+  --set ingress.tls.source=secret   # dùng chứng chỉ CA nội bộ
 ```
+**Kiểm tra:** truy cập `https://rancher.vnpt.vn`, import/quản lý cụm K8s.
 
 ---
 
-## 4. Ingress controller (ingress-nginx)
-
-Điểm vào HTTPS cho Harbor/Jenkins/Kibana/Grafana/ArgoCD.
-
+## E. Namespaces & RBAC (trên cụm K8s)
 ```bash
-helm install ingress-nginx ingress-nginx/ingress-nginx \
-  -n ingress-nginx --create-namespace \
-  --set controller.replicaCount=2 \
-  --set controller.service.type=LoadBalancer \
-  --set controller.metrics.enabled=true
-```
-**Kiểm tra:** `kubectl -n ingress-nginx get svc` → có EXTERNAL-IP. Trỏ DNS các tên miền (`*.${BASE_DOMAIN}`) về IP này.
-
----
-
-## 5. cert-manager (TLS tự động)
-
-```bash
-helm install cert-manager jetstack/cert-manager \
-  -n cert-manager --create-namespace --set crds.enabled=true
-```
-
-Tạo `ClusterIssuer` (Let's Encrypt production) — `clusterissuer.yaml`:
-```yaml
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata: { name: letsencrypt-prod }
-spec:
-  acme:
-    server: https://acme-v02.api.letsencrypt.org/directory
-    email: devops@example.com
-    privateKeySecretRef: { name: letsencrypt-prod }
-    solvers:
-      - http01:
-          ingress: { class: nginx }
-```
-```bash
-kubectl apply -f clusterissuer.yaml
-kubectl get clusterissuer       # READY=True
-```
-> Nội bộ không ra Internet: thay bằng CA nội bộ (issuer kiểu CA) và phân phối root CA tới client.
-
----
-
-## 6. Quản lý bí mật: Vault + External Secrets Operator
-
-```bash
-# Vault (production: nên dùng cụm Vault sẵn có; dưới đây là dạng có HA + storage)
-helm install vault hashicorp/vault -n vault --create-namespace \
-  --set "server.ha.enabled=true" --set "server.ha.replicas=3"
-
-# External Secrets Operator: đồng bộ secret từ Vault vào K8s
-helm install external-secrets external-secrets/external-secrets \
-  -n external-secrets --create-namespace
-```
-Sau khi `vault operator init`/`unseal`, tạo `SecretStore` trỏ tới Vault. Từ đây mọi mật khẩu (Harbor, Jenkins, Grafana, Elastic…) lấy qua `ExternalSecret`, **không** ghi phẳng vào Git.
-
-> Phương án nhẹ hơn nhưng vẫn hợp lệ production: **Sealed Secrets** (Bitnami) — mã hóa secret để commit an toàn vào Git, phù hợp GitOps.
-
----
-
-## 7. Backup cụm: Velero
-
-```bash
-helm install velero vmware-tanzu/velero -n velero --create-namespace \
-  --set-file credentials.secretContents.cloud=./credentials-velero \
-  --set configuration.backupStorageLocation[0].provider=aws \
-  --set configuration.backupStorageLocation[0].bucket=velero-backup \
-  --set configuration.backupStorageLocation[0].config.region=default \
-  --set configuration.backupStorageLocation[0].config.s3Url=$S3_ENDPOINT \
-  --set "initContainers[0].name=velero-plugin-for-aws" \
-  --set "initContainers[0].image=velero/velero-plugin-for-aws:latest"
-# Lịch backup hằng ngày
-velero schedule create daily --schedule "0 2 * * *" --ttl 720h0m0s
-```
-
----
-
-## 8. Namespaces & RBAC
-
-```bash
-for ns in app jenkins registry logging monitoring argocd; do
+for ns in app argocd logging monitoring; do
   kubectl create namespace $ns
-  kubectl label namespace $ns pod-security.kubernetes.io/enforce=restricted \
-    pod-security.kubernetes.io/warn=restricted
+  kubectl label ns $ns pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/warn=restricted
 done
 ```
-> Gắn nhãn **Pod Security Admission = restricted** để ép workload chạy non-root, no-privilege theo chuẩn production. (Namespace hệ thống của operator có thể cần `baseline` — điều chỉnh khi cần.)
-
-Áp dụng **NetworkPolicy mặc định chặn hết**, rồi mở theo nhu cầu (ví dụ cho namespace `app`):
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata: { name: default-deny, namespace: app }
-spec:
-  podSelector: {}
-  policyTypes: [Ingress, Egress]
-```
+Áp dụng NetworkPolicy mặc định chặn cho namespace `app` rồi mở theo nhu cầu.
 
 ---
 
 ## Tổng kết file 01
-
-Cụm K8s HA đã sẵn sàng với: StorageClass bền, ingress-nginx, cert-manager (TLS), Vault + ESO (bí mật), Velero (backup), namespaces gắn Pod Security + NetworkPolicy mặc định. Sang `02-jenkins.md`.
+Mọi server đã được làm cứng, JUMP bastion hoạt động, cụm Kubernetes HA + Rancher sẵn sàng. Sang `02-jenkins.md`.

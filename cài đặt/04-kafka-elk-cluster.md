@@ -1,246 +1,152 @@
-# 04 — Kafka (Strimzi) + ELK (ECK) — giám sát log production
+# 04 — Giám sát log: Elasticsearch cluster + Kibana + Logstash (Ubuntu 24.04)
 
-Kiến trúc:
-```
-Pod → Filebeat (DaemonSet, TLS) → Kafka cluster (Strimzi, TLS+SASL+ACL)
-    → Logstash (persistent queue) → Elasticsearch (ECK, node roles, TLS+auth) → Kibana
-```
+Luồng log: **Filebeat (trên K8s) → Kafka (cụm 3 server, file `04b`) → Logstash → Elasticsearch (cụm) → Kibana**. File này cài **Elasticsearch cluster**, **Kibana** và **Logstash** trên các server riêng (Ubuntu 24.04), bật **bảo mật (TLS + xác thực)**.
 
-Khác bản lab: **mọi kết nối mã hóa + xác thực**, Kafka quản lý bằng **Strimzi operator** (chuẩn production trên K8s), Elasticsearch **tách vai trò node**, có **snapshot ra S3** và **ILM** quản lý vòng đời log.
+> Các server đã làm cứng theo file 01. Mở cổng nội cụm giới hạn theo subnet.
+
+```bash
+ES_VER=9.4.2        # đồng bộ phiên bản trên mọi node Elastic
+```
 
 ---
 
-## 1. Elasticsearch cluster + Kibana (ECK)
+## 1. Cài Elasticsearch (cụm 3 node)
 
-### 1.1 Operator ECK (bản mới nhất)
+Trên **mỗi node ES** (es-1/2/3):
 ```bash
-helm install elastic-operator elastic/eck-operator -n elastic-system --create-namespace
-kubectl -n elastic-system get pod
+sudo apt install -y gnupg apt-transport-https
+wget -qO- https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo gpg --dearmor -o /usr/share/keyrings/elastic.gpg
+echo "deb [signed-by=/usr/share/keyrings/elastic.gpg] https://artifacts.elastic.co/packages/9.x/apt stable main" | sudo tee /etc/apt/sources.list.d/elastic-9.x.list
+sudo apt update && sudo apt install -y elasticsearch=$ES_VER
 ```
-> ECK 3.4 yêu cầu Kubernetes ≥ 1.31. ECK bật **TLS + xác thực mặc định** — giữ nguyên (không tắt như bản lab).
 
-### 1.2 ES với vai trò node tách bạch — `es-cluster.yaml`
+Tối ưu heap (50% RAM, tối đa 31GB) — `/etc/elasticsearch/jvm.options.d/heap.options`:
+```
+-Xms8g
+-Xmx8g
+```
+Cấu hình `/etc/elasticsearch/elasticsearch.yml` (đổi tên/IP từng node):
 ```yaml
-apiVersion: elasticsearch.k8s.elastic.co/v1
-kind: Elasticsearch
-metadata: { name: logging-es, namespace: logging }
-spec:
-  version: 9.4.2
-  nodeSets:
-    - name: master
-      count: 3
-      config: { node.roles: ["master"] }
-      podTemplate:
-        spec:
-          containers:
-            - name: elasticsearch
-              resources: { requests: { memory: 2Gi, cpu: "1" }, limits: { memory: 2Gi } }
-      volumeClaimTemplates:
-        - metadata: { name: elasticsearch-data }
-          spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 10Gi } }, storageClassName: <ten-sc> }
-    - name: data
-      count: 3
-      config: { node.roles: ["data", "ingest"] }
-      podTemplate:
-        spec:
-          containers:
-            - name: elasticsearch
-              resources: { requests: { memory: 4Gi, cpu: "2" }, limits: { memory: 4Gi } }
-      volumeClaimTemplates:
-        - metadata: { name: elasticsearch-data }
-          spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 100Gi } }, storageClassName: <ten-sc> }
+cluster.name: vnpt-logs
+node.name: es-1
+node.roles: [ master, data, ingest ]
+path.data: /data/elasticsearch          # ổ riêng, noatime
+path.logs: /var/log/elasticsearch
+network.host: 10.0.1.11
+discovery.seed_hosts: ["10.0.1.11","10.0.1.12","10.0.1.13"]
+cluster.initial_master_nodes: ["es-1","es-2","es-3"]
+# Bảo mật (bật mặc định 8.x/9.x): TLS transport + http
+xpack.security.enabled: true
+xpack.security.transport.ssl.enabled: true
+xpack.security.http.ssl.enabled: true
+```
+Sinh chứng chỉ CA + node (chạy một lần, phân phối):
+```bash
+sudo /usr/share/elasticsearch/bin/elasticsearch-certutil ca --out /etc/elasticsearch/certs/ca.p12
+sudo /usr/share/elasticsearch/bin/elasticsearch-certutil cert --ca /etc/elasticsearch/certs/ca.p12 --out /etc/elasticsearch/certs/node.p12
+# Khai báo keystore/truststore p12 cho transport + http trong elasticsearch.yml
 ```
 ```bash
-kubectl apply -f es-cluster.yaml
-kubectl -n logging get elasticsearch    # HEALTH=green
+sudo systemctl enable --now elasticsearch
+# Đặt mật khẩu user dựng sẵn
+sudo /usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic
 ```
+**Kiểm tra:** `curl -k -u elastic https://10.0.1.11:9200/_cluster/health` → status green, 3 node.
 
-### 1.3 Kibana qua Ingress + TLS — `kibana.yaml`
+> Tối ưu: tách ổ data SSD; bật **ILM** để xoay vòng/giữ log (vd hot 7 ngày → xóa 30 ngày), tránh đầy đĩa.
+
+---
+
+## 2. Cài Kibana (server riêng)
+
+```bash
+sudo apt install -y kibana=$ES_VER
+```
+`/etc/kibana/kibana.yml`:
 ```yaml
-apiVersion: kibana.k8s.elastic.co/v1
-kind: Kibana
-metadata: { name: logging-kibana, namespace: logging }
-spec:
-  version: 9.4.2
-  count: 2
-  elasticsearchRef: { name: logging-es }
-  http:
-    tls: { selfSignedCertificate: { disabled: true } }   # TLS do ingress đảm nhиệm
-```
-Tạo Ingress `kibana.example.com` (cert-manager) trỏ vào service `logging-kibana-kb-http`. Mật khẩu user `elastic` lấy từ secret `logging-es-es-elastic-user`; production nên cấu hình **OIDC/SSO** cho Kibana.
-
-### 1.4 Snapshot ra S3 (DR) + ILM
-```bash
-# Đăng ký repository snapshot S3 (chạy qua curl tới ES, có auth + CA)
-PW=$(kubectl -n logging get secret logging-es-es-elastic-user -o go-template='{{.data.elastic | base64decode}}')
-kubectl -n logging exec logging-es-es-master-0 -- sh -c \
- "curl -s -k -u elastic:$PW -X PUT 'https://localhost:9200/_snapshot/s3_backup' \
-  -H 'Content-Type: application/json' -d '{\"type\":\"s3\",\"settings\":{\"bucket\":\"es-snapshots\",\"endpoint\":\"s3.example.com\"}}'"
-```
-Tạo **ILM policy** xoay vòng (hot→warm→delete) để khống chế dung lượng log; gắn vào index template `k8s-logs-*`. Đây là yêu cầu bắt buộc production để log không phình vô hạn.
-
----
-
-## 2. Kafka cluster qua Strimzi (TLS + SASL + ACL)
-
-### 2.1 Cài operator
-```bash
-helm install strimzi strimzi/strimzi-kafka-operator -n logging
-kubectl -n logging get pod -l name=strimzi-cluster-operator
-```
-
-### 2.2 Cụm Kafka 3 broker (KRaft) — `kafka.yaml`
-```yaml
-apiVersion: kafka.strimzi.io/v1beta2
-kind: KafkaNodePool
-metadata:
-  name: broker
-  namespace: logging
-  labels: { strimzi.io/cluster: logging-kafka }
-spec:
-  replicas: 3
-  roles: [controller, broker]
-  storage:
-    type: jbod
-    volumes:
-      - id: 0
-        type: persistent-claim
-        size: 50Gi
-        class: <ten-sc>
-        deleteClaim: false
----
-apiVersion: kafka.strimzi.io/v1beta2
-kind: Kafka
-metadata:
-  name: logging-kafka
-  namespace: logging
-  annotations: { strimzi.io/node-pools: enabled, strimzi.io/kraft: enabled }
-spec:
-  kafka:
-    version: 3.8.0
-    replicas: 3
-    listeners:
-      - name: tls
-        port: 9093
-        type: internal
-        tls: true
-        authentication: { type: tls }      # mTLS
-    authorization: { type: simple }          # bật ACL
-    config:
-      offsets.topic.replication.factor: 3
-      transaction.state.log.replication.factor: 3
-      transaction.state.log.min.isr: 2
-      default.replication.factor: 3
-      min.insync.replicas: 2
-  entityOperator: { topicOperator: {}, userOperator: {} }
+server.host: "0.0.0.0"
+server.publicBaseUrl: "https://kibana.vnpt.vn"
+elasticsearch.hosts: ["https://10.0.1.11:9200"]
+elasticsearch.username: "kibana_system"
+elasticsearch.password: "<mật khẩu>"
+elasticsearch.ssl.certificateAuthorities: ["/etc/kibana/certs/ca.crt"]
+# TLS cho Kibana
+server.ssl.enabled: true
+server.ssl.certificate: /etc/ssl/vnpt/kibana.crt
+server.ssl.key: /etc/ssl/vnpt/kibana.key
 ```
 ```bash
-kubectl apply -f kafka.yaml
-kubectl -n logging get kafka,strimzipodset
+sudo systemctl enable --now kibana
+sudo ufw allow from 10.0.0.0/24 to any port 5601 proto tcp
 ```
+Truy cập `https://kibana.vnpt.vn:5601`. Production nên cấu hình **SSO** cho Kibana.
 
-### 2.3 Topic + user (ACL) cho log — `kafka-topic-user.yaml`
-```yaml
-apiVersion: kafka.strimzi.io/v1beta2
-kind: KafkaTopic
-metadata: { name: k8s-logs, namespace: logging, labels: { strimzi.io/cluster: logging-kafka } }
-spec: { partitions: 6, replicas: 3, config: { retention.ms: 604800000 } }
 ---
-apiVersion: kafka.strimzi.io/v1beta2
-kind: KafkaUser
-metadata: { name: filebeat, namespace: logging, labels: { strimzi.io/cluster: logging-kafka } }
-spec:
-  authentication: { type: tls }
-  authorization:
-    type: simple
-    acls:
-      - resource: { type: topic, name: k8s-logs }
-        operations: [Write, Describe]
----
-apiVersion: kafka.strimzi.io/v1beta2
-kind: KafkaUser
-metadata: { name: logstash, namespace: logging, labels: { strimzi.io/cluster: logging-kafka } }
-spec:
-  authentication: { type: tls }
-  authorization:
-    type: simple
-    acls:
-      - resource: { type: topic, name: k8s-logs }
-        operations: [Read, Describe]
-      - resource: { type: group, name: logstash }
-        operations: [Read]
+
+## 3. Cài Logstash (đọc Kafka → ghi Elasticsearch)
+
+Trên server Logstash:
+```bash
+sudo apt install -y logstash=$ES_VER
 ```
-Strimzi tự tạo secret chứng chỉ client cho mỗi KafkaUser (vd `filebeat`, `logstash`) — dùng để mount vào Filebeat/Logstash.
-
----
-
-## 3. Logstash (persistent queue, đọc Kafka mTLS → ghi ES)
-
-`logstash.yaml` (ConfigMap + Deployment 2 node, mount chứng chỉ Kafka user `logstash` và CA của ES):
+`/etc/logstash/conf.d/k8s-logs.conf`:
 ```
 input {
   kafka {
-    bootstrap_servers => "logging-kafka-kafka-bootstrap.logging.svc:9093"
+    bootstrap_servers => "kafka-1:9093,kafka-2:9093,kafka-3:9093"
     topics => ["k8s-logs"]
     group_id => "logstash"
     codec => json
     security_protocol => "SSL"
-    ssl_truststore_location => "/certs/kafka/ca.p12"
-    ssl_keystore_location => "/certs/kafka/user.p12"
+    ssl_truststore_location => "/etc/logstash/certs/kafka-ca.p12"
+    ssl_keystore_location => "/etc/logstash/certs/logstash-user.p12"
   }
+}
+filter {
+  if [kubernetes] { mutate { add_field => { "pod" => "%{[kubernetes][pod][name]}" "ns" => "%{[kubernetes][namespace]}" } } }
 }
 output {
   elasticsearch {
-    hosts => ["https://logging-es-es-http.logging.svc:9200"]
-    user => "elastic"
-    password => "${ES_PASSWORD}"
-    ssl_certificate_authorities => "/certs/es/ca.crt"
+    hosts => ["https://10.0.1.11:9200"]
+    user => "logstash_writer"
+    password => "<mật khẩu>"
+    ssl_certificate_authorities => "/etc/logstash/certs/es-ca.crt"
     ilm_enabled => true
     ilm_rollover_alias => "k8s-logs"
     ilm_policy => "k8s-logs-policy"
   }
 }
 ```
-Bật **persistent queue** (`queue.type: persisted`) trong `logstash.yml` để không mất sự kiện khi Logstash restart. Đặt resources requests=limits, 2 replica.
+Bật **persistent queue** trong `/etc/logstash/logstash.yml` (`queue.type: persisted`) để không mất sự kiện. Heap Logstash ~1–2GB.
+```bash
+sudo systemctl enable --now logstash
+```
 
 ---
 
-## 4. Filebeat (DaemonSet) → Kafka qua TLS
+## 4. Filebeat trên Kubernetes → Kafka
 
-`filebeat.yml` (điểm khác bản lab: output Kafka có TLS + client cert của KafkaUser `filebeat`):
+Filebeat chạy **DaemonSet trên cụm K8s**, thu log pod và đẩy vào Kafka (cụm `04b`) qua TLS + chứng chỉ KafkaUser `filebeat`. Cấu hình output Kafka:
 ```yaml
-filebeat.inputs:
-  - type: container
-    paths: [ /var/log/containers/*.log ]
-    processors:
-      - add_kubernetes_metadata:
-          host: ${NODE_NAME}
-          matchers: [ { logs_path: { logs_path: "/var/log/containers/" } } ]
 output.kafka:
-  hosts: ["logging-kafka-kafka-bootstrap.logging.svc:9093"]
+  hosts: ["kafka-1:9093","kafka-2:9093","kafka-3:9093"]
   topic: "k8s-logs"
   ssl.certificate_authorities: ["/certs/ca.crt"]
   ssl.certificate: "/certs/user.crt"
   ssl.key: "/certs/user.key"
-  required_acks: 1
-  codec.json: { pretty: false }
+  codec.json: {}
 ```
-DaemonSet mount secret chứng chỉ của KafkaUser `filebeat`, đặt resources limits, `securityContext` tối thiểu cần thiết (đọc `/var/log`).
+(Manifest DaemonSet đầy đủ + tạo KafkaUser xem file `04b` mục 10 và 14.)
 
 ---
 
 ## 5. Kiểm tra end-to-end
 ```bash
-kubectl run logtest --image=busybox -n app --restart=Never -- sh -c "echo prod-log-test; sleep 2"
-# Kafka nhận?
-kubectl -n logging exec logging-kafka-broker-0 -- bin/kafka-console-consumer.sh \
-  --topic k8s-logs --from-beginning --max-messages 1 \
-  --bootstrap-server localhost:9093 --consumer.config /tmp/client.properties
-# ES có index?  Kibana Discover (data view k8s-logs-*) thấy prod-log-test
+kubectl run logtest -n app --image=busybox --restart=Never -- sh -c "echo vnpt-log-test; sleep 2"
 ```
+Kafka nhận → Logstash xử lý → ES có index `k8s-logs-*` → tìm `vnpt-log-test` trên **Kibana Discover**.
 
 ---
 
 ## Tổng kết file 04
-
-Luồng log production: Filebeat (TLS) → Kafka (Strimzi, mTLS+ACL, RF=3) → Logstash (PQ) → Elasticsearch (ECK, node roles, snapshot S3, ILM) → Kibana. Sang `05-dong-goi-app-pipeline.md`.
+Cụm ELK (Elasticsearch + Kibana + Logstash) chạy nội bộ, bật bảo mật TLS + xác thực, đọc log từ cụm Kafka. Cụm Kafka xem `04b-kafka-cluster-3-server.md`. Sang `05-dong-goi-app-pipeline.md`.
