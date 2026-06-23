@@ -48,7 +48,7 @@ resources:
 ```
 `Chart.yaml` có dòng `appVersion` — chính là **tag image** mà pipeline sẽ cập nhật:
 ```yaml
-appVersion: "stage-v260408-01"
+appVersion: "stage-v20260623-04"
 ```
 Commit chart lên kho `devsecops`.
 
